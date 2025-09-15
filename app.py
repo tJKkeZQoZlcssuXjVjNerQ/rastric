@@ -3,6 +3,7 @@ import requests
 import time
 import json
 import os
+import re # Importamos el módulo de expresiones regulares
 
 # === Leemos TODAS las variables de entorno que configurarás en Koyeb ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -20,6 +21,14 @@ HEADERS = {
 }
 STATE_FILE = "estado.json"
 
+# === Configuración para la segunda paquetería (Loginext) ===
+LOGINEXT_URL_CHECK = "https://products.loginextsolutions.com/ShipmentApp/shipment/fmlm/get/webLinkdata"
+LOGINEXT_URL_DETAILS = "https://products.loginextsolutions.com/ShipmentApp/middlemile/shipment/order/iframe/details"
+LOGINEXT_HEADERS = {
+    'www-authenticate': 'BASIC c586fa65-473e-454d-826b-448cea88b320',
+    'Content-Type': 'application/json'
+}
+
 # === Bot functions (sin cambios) ===
 def get_tracking():
     if not PAYLOAD or not API_TOKEN:
@@ -28,25 +37,6 @@ def get_tracking():
     r = requests.post(API_URL, headers=HEADERS, data=PAYLOAD)
     r.raise_for_status()
     return r.json()
-  
-def get_chat_id():
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    r = requests.get(url).json()
-    try:
-        message = r["result"][-1]["message"]
-        chat_id = message["chat"]["id"]
-        text = message.get("text", "")
-
-        # Si el último mensaje fue /start → responder
-        if text == "/start":
-            url_send = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            requests.post(url_send, data={"chat_id": chat_id, "text": "👋 Hola! Estoy activo y te avisaré de cambios en tu paquete 📦"})
-
-        return chat_id
-    except Exception as e:
-        print("Error obteniendo chat_id:", e)
-        return None
-
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -65,6 +55,82 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
+
+# === NUEVAS FUNCIONES para Loginext ===
+def check_loginext_guidance(guide_number):
+    """Primera verificación a Loginext para ver si la guía es válida."""
+    print(f"🔎 Verificando guía de Loginext: {guide_number}")
+    payload = json.dumps({"orderNo": guide_number})
+    try:
+        response = requests.post(LOGINEXT_URL_CHECK, headers=LOGINEXT_HEADERS, data=payload)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == 200 and not data.get("hasError"):
+            print("✅ Guía de Loginext válida.")
+            return True
+        else:
+            print(f"⚠️ Guía de Loginext inválida o con error: {data.get('message')}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de red al verificar guía de Loginext: {e}")
+        return False
+    
+def get_loginext_details(guide_number):
+    """Obtiene los detalles completos y el orderRefId de Loginext."""
+    print(f"📄 Obteniendo detalles de Loginext para: {guide_number}")
+    payload = json.dumps({
+        "userType": "DELIVERCUSTOMER",
+        "orderNo": guide_number
+    })
+    try:
+        response = requests.post(LOGINEXT_URL_DETAILS, headers=LOGINEXT_HEADERS, data=payload)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == 200:
+            order_ref_id = data.get("data", {}).get("orderRefId")
+            if order_ref_id:
+                print(f"✅ Obtenido orderRefId: {order_ref_id}")
+                return order_ref_id
+            else:
+                print("❌ No se encontró 'orderRefId' en la respuesta de Loginext.")
+                return None
+        else:
+            print("❌ La respuesta de detalles de Loginext no fue exitosa.")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de red al obtener detalles de Loginext: {e}")
+        return None
+
+def process_secondary_tracking(ubicacion, last_state):
+    """Busca, procesa y notifica el tracking de la segunda paquetería."""
+    # Usamos una expresión regular para encontrar el número de guía
+    match = re.search(r"guia\s+([\w-]+)", ubicacion, re.IGNORECASE)
+    if not match:
+        return
+
+    guide_number = match.group(1)
+    # Verificamos si esta guía ya fue procesada
+    if last_state.get("secondary_guide_processed") == guide_number:
+        print(f"ℹ️ La guía secundaria {guide_number} ya fue procesada. Omitiendo.")
+        return
+
+    print(f"‼️ Detectada nueva guía de tránsito: {guide_number}")
+    
+    # 1. Verificar si la guía es válida
+    if check_loginext_guidance(guide_number):
+        # 2. Obtener el orderRefId
+        order_ref_id = get_loginext_details(guide_number)
+        
+        if order_ref_id:
+            # 3. Construir la URL y enviar la notificación
+            final_url = f"https://products.loginextsolutions.com/trackall/#/order?referenceId={order_ref_id}&aid=c586fa65-473e-454d-826b-448cea88b320&type=DELIVERCUSTOMER"
+            msg = f"🚚 Tu paquete ha sido transferido a la paquetería local.\n\nGuía: {guide_number}\n\nPuedes rastrearlo aquí:\n{final_url}"
+            send_telegram(msg)
+            print("✅ Notificación de seguimiento local enviada a Telegram.")
+            
+            # 4. Guardar el estado para no volver a notificar
+            last_state["secondary_guide_processed"] = guide_number
+            save_state(last_state)
 
 def tracking_loop():
     global CHAT_ID
@@ -95,13 +161,15 @@ def tracking_loop():
                     save_state(last_state)
                 else:
                     print(f"Sin cambios. Estado actual: {new_status}")
+                # --- NUEVA LÓGICA para la segunda paquetería ---
+                process_secondary_tracking(ubicacion, last_state)
             
         except requests.exceptions.RequestException as e:
             print(f"Error de red al obtener tracking: {e}")
         except Exception as e:
             print(f"Error inesperado en el loop: {e}")
-
-        time.sleep(300)
+        print("--- Esperando 3 minutos para la próxima verificación ---")
+        time.sleep(180)
 
 # === Punto de entrada principal ===
 if __name__ == "__main__":
