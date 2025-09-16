@@ -3,7 +3,7 @@ import requests
 import time
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # === VARIABLES DE ENTORNO ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -58,7 +58,7 @@ def save_state(state):
 
 def fmt_ts_local(ts_ms: int):
     try:
-        dt_utc = datetime.utcfromtimestamp(ts_ms / 1000.0)
+        dt_utc = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
         dt_local = dt_utc - timedelta(hours=6)  # Tegucigalpa UTC-6 (sin DST)
         return dt_local.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
